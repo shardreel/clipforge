@@ -1,8 +1,9 @@
 //! User settings (LLM provider and keys) stored in ~/.clipforge/settings.json.
-//! Lookup order for secrets: settings.json, process env, ~/.clipforge/.env.
+//! Lookup order for secrets: settings.json, process env, ~/.clipforge/.env, then ./.env.
 use crate::paths;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 pub const DEFAULT_NICHE: &str = "Game: GTA 6 (Grand Theft Auto VI). Audience: gaming TikTok/Shorts.";
 
@@ -20,7 +21,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            llm: "none".into(),
+            // provider only: keys stay out of the struct so saving never copies them from .env
+            llm: env_or_dotenv("CLIPFORGE_LLM").unwrap_or_else(|| "none".into()),
             llm_model: None,
             gemini_api_key: String::new(),
             openrouter_api_key: String::new(),
@@ -34,13 +36,19 @@ fn file() -> std::path::PathBuf {
     paths::data_dir().join("settings.json")
 }
 
+/// ./.env (handy when running from a checkout), overridden by ~/.clipforge/.env.
 fn dotenv() -> HashMap<String, String> {
-    let text = std::fs::read_to_string(paths::data_dir().join(".env")).unwrap_or_default();
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().trim_matches(['"', '\'']).to_string()))
+    [PathBuf::from(".env"), paths::data_dir().join(".env")]
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .flat_map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .filter_map(|l| l.split_once('='))
+                .map(|(k, v)| (k.trim().to_string(), v.trim().trim_matches(['"', '\'']).to_string()))
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 

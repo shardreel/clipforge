@@ -61,6 +61,11 @@ pub fn has_nvidia() -> bool {
     Command::new("nvidia-smi").arg("-L").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
+/// No Apple Silicon and no NVIDIA GPU: whisper runs on the CPU, so default to light settings.
+pub fn lite_recommended() -> bool {
+    os() != Os::Mac && !has_nvidia() && !cfg!(feature = "cuda")
+}
+
 /// Whisper backend compiled into this binary.
 pub fn whisper_backend() -> &'static str {
     if cfg!(target_os = "macos") {

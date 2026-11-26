@@ -29,6 +29,11 @@ pub struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if self.0.is_server_error() {
+            tracing::error!("API {}: {}", self.0.as_u16(), self.1);
+        } else {
+            tracing::warn!("API {}: {}", self.0.as_u16(), self.1);
+        }
         (self.0, Json(json!({ "error": self.1 }))).into_response()
     }
 }
@@ -56,6 +61,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/jobs/{id}", get(get_job))
         .route("/api/jobs/{id}/events", get(job_events))
         .route("/api/jobs/{id}/rerender", post(rerender))
+        .route("/api/jobs/{id}/cancel", post(cancel_job))
+        .route("/api/jobs/{id}/review", post(review_job))
         .route("/api/jobs/{id}/files/{name}", get(job_file))
         .route("/api/uploads", post(upload).layer(DefaultBodyLimit::disable()))
         .route("/api/storage", get(storage_report))
@@ -80,7 +87,8 @@ async fn health() -> Json<Value> {
         "libass": media::has_libass(),
         "encoder": enc.name,
         "hardware_encoder": enc.hardware(),
-        "whisper_model": crate::transcribe::model_path("turbo").exists(),
+        "whisper_model": (["turbo", "large", "small", "base"].iter().any(|m| crate::transcribe::model_path(m).exists())),
+        "lite_recommended": crate::platform::lite_recommended(),
     }))
 }
 
@@ -112,7 +120,12 @@ async fn storage_clear(State(s): State<AppState>, Path(kind): Path<String>) -> A
 
 async fn defaults() -> Json<Value> {
     let s = Settings::load();
-    Json(json!(Options { llm: s.llm, llm_model: s.llm_model, niche: s.niche, ..Options::default() }))
+    let base = Options { llm: s.llm, llm_model: s.llm_model, niche: s.niche, ..Options::default() };
+    // CPU-only machines: the base whisper model is ~3x faster than small and ~10x than turbo, and
+    // light mode keeps renders to one at a time at 30 fps.
+    let lite = tokio::task::spawn_blocking(crate::platform::lite_recommended).await.unwrap_or(false);
+    let opts = if lite { Options { lite: true, asr_model: "base".into(), workers: 1, ..base } } else { base };
+    Json(json!(opts))
 }
 
 async fn get_settings() -> Json<Value> {
@@ -195,11 +208,31 @@ async fn rerender(State(s): State<AppState>, Path(id): Path<String>, Json(b): Js
     Ok(Json(json!(s.jobs.submit(job.source, b.options))))
 }
 
+#[derive(Deserialize)]
+struct Review {
+    moments: Vec<crate::picker::Moment>,
+}
+
+async fn review_job(State(s): State<AppState>, Path(id): Path<String>, Json(b): Json<Review>) -> ApiResult<Json<Value>> {
+    s.jobs.submit_review(&id, b.moments).map_err(bad_request)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn cancel_job(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    // killing child processes runs a few short commands; keep them off the async runtime
+    let jobs = Arc::clone(&s.jobs);
+    let found = tokio::task::spawn_blocking(move || jobs.cancel(&id)).await?;
+    match found {
+        Some(cancelling) => Ok(Json(json!({ "cancelling": cancelling }))),
+        None => Err(not_found("job")),
+    }
+}
+
 type EventStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
 async fn job_events(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let (job, rx) = s.jobs.subscribe(&id).ok_or_else(|| not_found("job"))?;
-    let terminal = job.status == "done" || job.status == "failed";
+    let terminal = ["done", "failed", "cancelled"].contains(&job.status.as_str());
     let first = tokio_stream::once(Ok(Event::default().data(json!({"type": "snapshot", "job": job}).to_string())));
     let stream: EventStream = if terminal {
         Box::pin(first)

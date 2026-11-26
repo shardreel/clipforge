@@ -23,9 +23,17 @@ export function OptionsForm({ options: o, onChange, source }: Props) {
   const local = source && !isUrl(source) ? source : null;
   const [aspect, setAspect] = useState(16 / 9);
   const [mac, setMac] = useState(false);
+  const [gpuEncoder, setGpuEncoder] = useState<string | null>(null);
+  const [chunked, setChunked] = useState(Boolean(o.chunk_len));
 
   useEffect(() => {
-    api.health().then((h) => setMac(h.platform === "macos")).catch(() => undefined);
+    api
+      .health()
+      .then((h) => {
+        setMac(h.platform === "macos");
+        setGpuEncoder(h.hardware_encoder ? h.encoder : null);
+      })
+      .catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -54,6 +62,14 @@ export function OptionsForm({ options: o, onChange, source }: Props) {
           <Field label="Max length (s)">
             <NumInput value={o.max_len} min={5} onChange={(v) => set({ max_len: v })} />
           </Field>
+        </div>
+        <div style={{ marginTop: 12 }}>
+          <Switch
+            label="Review before rendering"
+            hint="Pause after picking so you can untick, retitle and trim moments. Rendering is the slow part on older PCs, so skipping weak picks saves the most time."
+            checked={o.review}
+            onChange={(v) => set({ review: v })}
+          />
         </div>
         <div style={{ marginTop: 16 }}>
           <Field label="Output folder" hint="Rendered clips are saved here, in a subfolder named after the video.">
@@ -112,11 +128,12 @@ export function OptionsForm({ options: o, onChange, source }: Props) {
           {o.asr === "whisper" && (
             <>
               <div style={{ width: 200 }}>
-                <Field label="Model">
+                <Field label="Model" hint="base is fast but English-only in practice; for Hindi and other languages small is used automatically.">
                   <select value={o.asr_model} onChange={(e) => set({ asr_model: e.target.value as Options["asr_model"] })}>
                     <option value="turbo">large-v3-turbo</option>
                     <option value="large">large-v3</option>
                     <option value="small">small (fast)</option>
+                    <option value="base">base (fastest, for older PCs)</option>
                   </select>
                 </Field>
               </div>
@@ -175,13 +192,95 @@ export function OptionsForm({ options: o, onChange, source }: Props) {
           </div>
         </div>
         <div style={{ marginTop: 8 }}>
+          <Switch
+            label="Light mode"
+            hint="For machines without a dedicated GPU: renders at 30 fps, one clip at a time. On by default when no NVIDIA or Apple GPU is found."
+            checked={o.lite}
+            onChange={(v) => set({ lite: v })}
+          />
           {!mac && (
-            <Switch label="Software encoding" hint="Force libx264/libx265 instead of the GPU encoder (NVENC)" checked={o.software} onChange={(v) => set({ software: v })} />
+            <Switch
+              label="Software encoding"
+              hint={
+                gpuEncoder
+                  ? `Leave off: your GPU encoder (${gpuEncoder}) is 2-3x faster. Only turn on if renders fail.`
+                  : "No GPU encoder found, so the CPU (libx264) is used either way."
+              }
+              checked={o.software}
+              onChange={(v) => set({ software: v })}
+            />
           )}
           <Switch label="Fresh analysis" hint="Ignore cached transcript, signals and picks" checked={o.fresh} onChange={(v) => set({ fresh: v })} />
         </div>
       </Card>
 
+      <Card
+        title="Long videos"
+        right={
+          <Switch
+            label=""
+            checked={chunked}
+            onChange={(on) => {
+              setChunked(on);
+              set(
+                on
+                  ? { chunk_len: 600, chunk_overlap: 30, heatmap_prioritize: true, long_mode: "scan" }
+                  : { chunk_len: null, chunk_overlap: null, heatmap_prioritize: null, long_mode: null },
+              );
+            }}
+          />
+        }
+      >
+        <p className="hint" style={{ margin: 0 }}>
+          For URLs of long streams: never download the whole video. Local files and videos under about 10 minutes run in
+          one pass.
+        </p>
+        {chunked && (
+          <div style={{ marginTop: 16 }}>
+            <Field
+              label="Strategy"
+              hint={
+                o.long_mode === "chunks"
+                  ? "Downloads, analyses and renders a few minutes at a time, and stops once it has enough clips. Uses on-screen action too, but clips come from early in the video unless it has a replay heatmap."
+                  : "Downloads only the audio (about 50 MB per hour), finds the best moments across the whole video, then downloads just those moments' video. Least bandwidth and disk."
+              }
+            >
+              <Seg
+                value={o.long_mode === "chunks" ? "chunks" : "scan"}
+                onChange={(v) => set({ long_mode: v })}
+                options={[
+                  { value: "scan", label: "Scan whole video" },
+                  { value: "chunks", label: "Chunk by chunk" },
+                ]}
+              />
+            </Field>
+          </div>
+        )}
+        {chunked && o.long_mode === "chunks" && (
+          <div className="grid g2" style={{ marginTop: 16 }}>
+            <Field label="Chunk length">
+              <select value={String(Math.round((o.chunk_len ?? 600) / 60))} onChange={(e) => set({ chunk_len: Number(e.target.value) * 60 })}>
+                <option value="5">5 minutes</option>
+                <option value="10">10 minutes (recommended)</option>
+                <option value="15">15 minutes</option>
+              </select>
+            </Field>
+            <Field label="Overlap (s)" hint="Shared by neighbouring chunks so a moment on the edge is seen whole.">
+              <NumInput value={o.chunk_overlap ?? 30} min={0} max={120} onChange={(v) => set({ chunk_overlap: v })} />
+            </Field>
+          </div>
+        )}
+        {chunked && (
+          <div style={{ marginTop: 8 }}>
+            <Switch
+              label="Favour most replayed, skip intro and outro"
+              hint="Weights YouTube's replay heatmap when the video has one, and plays down the first and last few minutes."
+              checked={o.heatmap_prioritize !== false}
+              onChange={(v) => set({ heatmap_prioritize: v })}
+            />
+          </div>
+        )}
+      </Card>
     </>
   );
 }

@@ -16,7 +16,7 @@ export interface Options {
   target_len: number;
   layout: Layout;
   asr: "whisper" | "none";
-  asr_model: "turbo" | "large" | "small";
+  asr_model: "turbo" | "large" | "small" | "base";
   language: string | null;
   llm: "none" | "gemini" | "lmstudio" | "ollama" | "openrouter";
   llm_model: string | null;
@@ -31,6 +31,12 @@ export interface Options {
   software: boolean;
   workers: number;
   fresh: boolean;
+  lite: boolean;
+  chunk_len?: number | null;
+  chunk_overlap?: number | null;
+  long_mode?: "scan" | "chunks" | null;
+  review: boolean;
+  heatmap_prioritize?: boolean | null;
 }
 
 export interface Moment {
@@ -58,7 +64,7 @@ export interface Progress {
   kind: "video" | "audio";
 }
 
-export type JobStatus = "queued" | "running" | "done" | "failed";
+export type JobStatus = "queued" | "running" | "review" | "done" | "failed" | "cancelled";
 
 export interface Job {
   id: string;
@@ -72,6 +78,8 @@ export interface Job {
   out_dir: string | null;
   error: string | null;
   created_at: number;
+  review?: Moment[] | null;
+  review_preselect?: number;
 }
 
 export interface PreflightCheck {
@@ -102,6 +110,7 @@ export interface Health {
   encoder: string;
   hardware_encoder: boolean;
   whisper_model: boolean;
+  lite_recommended: boolean;
 }
 
 export interface SettingsView {
@@ -136,7 +145,8 @@ export type JobEvent =
   | { type: "stage"; stage: string }
   | { type: "log"; line: string }
   | { type: "progress"; progress: Progress }
-  | { type: "status"; status: JobStatus; error?: string };
+  | { type: "status"; status: JobStatus; error?: string }
+  | { type: "review"; moments: Moment[]; preselect: number };
 
 export interface StorageItem {
   bytes: number;

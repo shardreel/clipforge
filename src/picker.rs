@@ -145,13 +145,51 @@ pub fn candidates(
     out
 }
 
+/// Two windows share at least 40% of the shorter one.
+pub fn overlapping(a: &Moment, b: &Moment) -> bool {
+    a.end.min(b.end) - a.start.max(b.start) >= 0.4 * a.duration().min(b.duration())
+}
+
+/// The game from a niche like "Game: Call of Duty Mobile (CODM). Audience: ...": the shorter of
+/// the name and its bracketed alias ("CODM"; "GTA 6" for the default niche). "Gaming" if absent.
+pub fn game_name(niche: &str) -> String {
+    let Some((name, alias)) = niche_game(niche) else { return "Gaming".into() };
+    match alias {
+        Some(a) if a.chars().count() < name.chars().count() => a,
+        _ => name,
+    }
+}
+
+/// Fallback hashtags: the game (name and alias, e.g. #codm #callofdutymobile) plus generic tags.
+pub fn niche_hashtags(niche: &str) -> Vec<String> {
+    let tag = |s: &str| {
+        let t: String = s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+        (!t.is_empty()).then(|| format!("#{t}"))
+    };
+    let mut tags: Vec<String> = vec![];
+    if let Some((name, alias)) = niche_game(niche) {
+        tags.extend(alias.as_deref().and_then(tag));
+        tags.extend(tag(&name));
+    }
+    tags.extend(["#gaming".to_string(), "#shorts".to_string()]);
+    tags.dedup();
+    tags
+}
+
+fn niche_game(niche: &str) -> Option<(String, Option<String>)> {
+    let rest = &niche[niche.to_lowercase().find("game:")? + 5..];
+    let line = rest.split(['.', '\n']).next()?.trim();
+    let (name, alias) = match line.split_once('(') {
+        Some((n, a)) => (n.trim(), a.split(')').next().map(|a| a.trim().to_string()).filter(|a| !a.is_empty())),
+        None => (line, None),
+    };
+    (!name.is_empty()).then(|| (name.to_string(), alias))
+}
+
 pub fn dedupe(ms: Vec<Moment>) -> Vec<Moment> {
-    let overlap = 0.4;
     let mut kept: Vec<Moment> = vec![];
     for m in ms {
-        let clear = kept.iter().all(|k| {
-            m.end.min(k.end) - m.start.max(k.start) < overlap * m.duration().min(k.duration())
-        });
+        let clear = kept.iter().all(|k| !overlapping(&m, k));
         if clear {
             kept.push(m);
         }
@@ -159,21 +197,33 @@ pub fn dedupe(ms: Vec<Moment>) -> Vec<Moment> {
     kept
 }
 
-pub fn fallback_titles(ms: &mut [Moment], segments: &[Segment], tag: &str) {
+/// A placeholder title from `placeholder_title`, whatever its number.
+pub fn is_placeholder(title: &str) -> bool {
+    title.rsplit_once(" moment #").is_some_and(|(_, n)| n.parse::<usize>().is_ok())
+}
+
+/// Title for a moment with no speech and no model-written title.
+pub fn placeholder_title(tag: &str, n: usize) -> String {
+    format!("{tag} moment #{n}")
+}
+
+pub fn fallback_titles(ms: &mut [Moment], segments: &[Segment], tag: &str, hashtags: &[String]) {
     for (i, m) in ms.iter_mut().enumerate() {
         if m.title.is_empty() {
             let text = text_in(segments, m.peak - 3.0, m.peak + 3.0);
             let head = text.split_whitespace().take(8).collect::<Vec<_>>().join(" ");
             let head = head.trim_matches(|c| c == ' ' || c == ',' || c == '.').to_string();
-            m.title = if head.is_empty() { format!("{tag} moment #{}", i + 1) } else { head };
+            // a stray word or two ("of", "(music)") makes a worse title than the placeholder
+            let words = head.split_whitespace().filter(|w| w.chars().any(char::is_alphanumeric)).count();
+            m.title = if words < 3 { placeholder_title(tag, i + 1) } else { head };
         }
         if m.hashtags.is_empty() {
-            m.hashtags = ["#gta6", "#gta", "#gaming", "#shorts"].map(String::from).to_vec();
+            m.hashtags = hashtags.to_vec();
         }
     }
 }
 
-const SYSTEM: &str = "You are a short-form video editor for gaming clips (GTA, open-world action games).
+const SYSTEM: &str = "You are a short-form video editor for gaming clips (the game and audience are given below).
 You pick moments that will hold attention on TikTok / Reels / Shorts: chaos, chases, crashes,
 fails, funny reactions, clutch escapes, surprising physics, strong one-liners.
 A good clip has a hook in the first 2 seconds and a payoff. No slow intros, no menus/loading screens.";
@@ -188,6 +238,22 @@ pub struct PickOpts<'a> {
     pub niche: &'a str,
     pub video: &'a Path,
     pub enc: &'a Encoder,
+    /// Added to the excitement curve per second (replay heatmap, intro/outro penalty). May be empty.
+    pub bias: &'a [f64],
+}
+
+fn biased_curve(sig: &Signals, segments: &[Segment], bias: &[f64]) -> Vec<f64> {
+    let mut curve = excitement(sig, segments);
+    for (c, b) in curve.iter_mut().zip(bias) {
+        *c += b;
+    }
+    curve
+}
+
+/// Candidate windows from signals alone, wider than clips: where to spend transcription.
+pub fn scout(sig: &Signals, bias: &[f64], duration: f64, n: usize, min_len: f64, max_len: f64, target: f64) -> Vec<Moment> {
+    let curve = biased_curve(sig, &[], bias);
+    candidates(&curve, &[], &[], duration, n, min_len, max_len, target.clamp(min_len, max_len))
 }
 
 fn frames_b64(video: &Path, m: &Moment, n: usize) -> Vec<String> {
@@ -235,7 +301,7 @@ fn refine_with_llm(
     }
     content.push(json!({"type": "text", "text": "\nReply with ONLY a JSON array, best first:\n\
 [{\"candidate\": 0, \"start\": 12.0, \"end\": 41.5, \"score\": 0-100,\n  \"title\": \"short punchy title (max 60 chars)\",\n  \
-\"hook\": \"on-screen hook text, max 6 words\",\n  \"hashtags\": [\"#gta6\", \"...\"], \"reason\": \"one sentence\"}]"}));
+\"hook\": \"on-screen hook text, max 6 words\",\n  \"hashtags\": [\"#tag\", \"...\"], \"reason\": \"one sentence\"}]"}));
     let reply = llm.chat(json!([
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": content},
@@ -305,7 +371,7 @@ pub fn pick(
     let mut ms = if duration <= o.min_len + 1.0 {
         vec![Moment { start: 0.0, end: round2(duration), score: 1.0, peak: duration / 2.0, ..Default::default() }]
     } else {
-        let curve = excitement(sig, segments);
+        let curve = biased_curve(sig, segments, o.bias);
         candidates(&curve, segments, &sig.cuts, duration, o.max_clips * 2, o.min_len, o.max_len, target)
     };
     match o.llm {
@@ -323,9 +389,48 @@ pub fn pick(
         }
         _ => ms.truncate(o.max_clips),
     }
-    fallback_titles(&mut ms, segments, "GTA");
+    fallback_titles(&mut ms, segments, &game_name(o.niche), &niche_hashtags(o.niche));
     if let Some(c) = cache {
         std::fs::write(c, serde_json::to_string_pretty(&ms)?)?;
     }
     Ok(ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcribe::Word;
+
+    fn seg(s: f64, text: &str) -> Segment {
+        let words = text.split_whitespace().enumerate().map(|(i, w)| Word { w: w.into(), s: s + i as f64 * 0.3, e: s + i as f64 * 0.3 + 0.2 }).collect();
+        Segment { s, e: s + 3.0, text: text.into(), words }
+    }
+
+    #[test]
+    fn fallback_titles_need_three_words() {
+        let mut ms = vec![Moment { start: 0.0, end: 30.0, peak: 10.0, ..Default::default() }; 2];
+        ms[1].peak = 50.0;
+        fallback_titles(&mut ms, &[seg(9.0, "of"), seg(49.0, "the only way through")], "GTA", &[]);
+        assert_eq!(ms[0].title, "GTA moment #1");
+        assert_eq!(ms[1].title, "the only way through");
+    }
+}
+
+#[cfg(test)]
+mod niche_tests {
+    use super::*;
+
+    #[test]
+    fn game_and_tags_follow_the_niche() {
+        let codm = "Game: Call of Duty Mobile (CODM). Audience: gaming Shorts. Commentary in Hindi.";
+        assert_eq!(game_name(codm), "CODM");
+        assert_eq!(niche_hashtags(codm), vec!["#codm", "#callofdutymobile", "#gaming", "#shorts"]);
+        let gta = crate::settings::DEFAULT_NICHE;
+        assert_eq!(game_name(gta), "GTA 6");
+        assert_eq!(niche_hashtags(gta)[0], "#grandtheftautovi");
+        assert_eq!(game_name("Funny moments"), "Gaming");
+        assert_eq!(niche_hashtags("Funny moments"), vec!["#gaming", "#shorts"]);
+        assert!(is_placeholder("CODM moment #12") && is_placeholder("GTA 6 moment #1"));
+        assert!(!is_placeholder("the only way through"));
+    }
 }

@@ -3,8 +3,9 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 const EXTRA_BIN_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
 /// Keg-only ffmpeg build with libass (captions). Preferred when installed.
@@ -50,11 +51,27 @@ pub struct Encoder {
     pub name: String,
     pub video_args: Vec<String>,
     pub decode_args: Vec<String>,
+    /// Global args that must come before the inputs (the VAAPI device).
+    pub device_args: Vec<String>,
+    /// Filter appended to the graph to hand frames to the encoder (VAAPI upload).
+    pub upload: Option<String>,
+    /// Software encoder to retry a clip with when this hardware encoder fails on it.
+    #[serde(skip)]
+    pub software: Option<Box<Encoder>>,
 }
 
 impl Encoder {
     pub fn hardware(&self) -> bool {
-        ["videotoolbox", "nvenc"].iter().any(|h| self.name.contains(h))
+        ["videotoolbox", "nvenc", "vaapi"].iter().any(|h| self.name.contains(h))
+    }
+
+    /// Frames are filtered and encoded on the CPU: parallel renders compete for the same cores.
+    pub fn cpu_bound(&self) -> bool {
+        !self.hardware() || self.name.contains("vaapi")
+    }
+
+    fn new(name: String, video_args: Vec<String>, decode_args: Vec<String>) -> Self {
+        Self { name, video_args, decode_args, device_args: vec![], upload: None, software: None }
     }
 }
 
@@ -68,6 +85,66 @@ fn bitrate(quality: &str) -> &'static str {
         "medium" => "8M",
         _ => "12M",
     }
+}
+
+/// ffmpeg lists encoders it was built with, not ones the driver supports (e.g. hevc_vaapi on
+/// older Intel iGPUs, NVENC with a stale driver). Encode a few frames once per encoder to be sure.
+fn encoder_works(enc: &Encoder) -> bool {
+    static SEEN: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some(ok) = seen.lock().unwrap().get(&enc.name) {
+        return *ok;
+    }
+    let ok = require("ffmpeg").is_ok_and(|ffmpeg| {
+        let mut cmd = Command::new(ffmpeg);
+        cmd.args(["-hide_banner", "-v", "error"]).args(&enc.device_args);
+        cmd.args(["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30", "-frames:v", "5"]);
+        if let Some(u) = &enc.upload {
+            cmd.args(["-vf", u]);
+        }
+        cmd.args(&enc.video_args).args(["-f", "null", "-"]);
+        cmd.output().is_ok_and(|o| o.status.success())
+    });
+    seen.lock().unwrap().insert(enc.name.clone(), ok);
+    ok
+}
+
+/// First DRM render node (Intel/AMD integrated or discrete GPU), or CLIPFORGE_VAAPI_DEVICE.
+fn vaapi_device() -> Option<PathBuf> {
+    if let Some(dev) = std::env::var_os("CLIPFORGE_VAAPI_DEVICE") {
+        return Some(PathBuf::from(dev));
+    }
+    let mut nodes: Vec<PathBuf> = std::fs::read_dir("/dev/dri")
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("renderD")))
+        .collect();
+    nodes.sort();
+    nodes.into_iter().next()
+}
+
+/// VAAPI on Intel/AMD GPUs, including integrated ones. Constant QP: the rate-control mode
+/// every VAAPI driver supports (older Intel iGPUs reject bitrate targets).
+fn vaapi_encoder(codec: &str, quality: &str) -> Option<Encoder> {
+    let name = format!("{codec}_vaapi");
+    if !ffmpeg_encoders().contains(&name) {
+        return None;
+    }
+    let dev = vaapi_device()?;
+    let qp = match quality {
+        "low" => "27",
+        "medium" => "24",
+        _ => "21",
+    };
+    let mut args = strs(&["-c:v", &name, "-qp", qp]);
+    if codec == "hevc" {
+        args.extend(strs(&["-tag:v", "hvc1"]));
+    }
+    let mut enc = Encoder::new(name, args, vec![]);
+    enc.device_args = vec!["-vaapi_device".into(), dev.to_string_lossy().into_owned()];
+    enc.upload = Some("format=nv12,hwupload".into());
+    Some(enc)
 }
 
 fn hardware_encoder(codec: &str, quality: &str) -> Option<Encoder> {
@@ -85,37 +162,39 @@ fn hardware_encoder(codec: &str, quality: &str) -> Option<Encoder> {
         if codec == "hevc" {
             args.extend(strs(&["-tag:v", "hvc1"]));
         }
-        return Some(Encoder { name: vt, video_args: args, decode_args: strs(&["-hwaccel", "videotoolbox"]) });
+        return Some(Encoder::new(vt, args, strs(&["-hwaccel", "videotoolbox"])));
     }
     let nv = format!("{codec}_nvenc");
-    if !ffmpeg_encoders().contains(&nv) || !platform::has_nvidia() {
-        return None;
-    }
-    let mut args = strs(&["-c:v", &nv, "-preset", "p5", "-b:v", rate, "-maxrate", rate, "-bufsize", "24M"]);
-    if codec == "hevc" {
-        args.extend(strs(&["-tag:v", "hvc1"]));
-    }
-    Some(Encoder { name: nv, video_args: args, decode_args: strs(&["-hwaccel", "cuda"]) })
-}
-
-/// Hardware encoder when available. On macOS hardware is always preferred (`force_software` ignored).
-pub fn pick_encoder(codec: &str, quality: &str, force_software: bool) -> Encoder {
-    if !force_software || cfg!(target_os = "macos") {
-        if let Some(enc) = hardware_encoder(codec, quality) {
-            return enc;
+    if ffmpeg_encoders().contains(&nv) && platform::has_nvidia() {
+        let mut args = strs(&["-c:v", &nv, "-preset", "p5", "-b:v", rate, "-maxrate", rate, "-bufsize", "24M"]);
+        if codec == "hevc" {
+            args.extend(strs(&["-tag:v", "hvc1"]));
+        }
+        let enc = Encoder::new(nv, args, strs(&["-hwaccel", "cuda"]));
+        if encoder_works(&enc) {
+            return Some(enc);
         }
     }
+    vaapi_encoder(codec, quality).filter(encoder_works)
+}
+
+/// Hardware encoder when available: VideoToolbox on Mac, else NVENC, else VAAPI (Intel/AMD,
+/// integrated GPUs too). On macOS hardware is always preferred (`force_software` ignored).
+pub fn pick_encoder(codec: &str, quality: &str, force_software: bool) -> Encoder {
     let crf = match quality {
         "low" => "25",
         "medium" => "22",
         _ => "19",
     };
     let lib = if codec == "hevc" { "libx265" } else { "libx264" };
-    Encoder {
-        name: lib.into(),
-        video_args: strs(&["-c:v", lib, "-preset", "veryfast", "-crf", crf]),
-        decode_args: vec![],
+    let sw = Encoder::new(lib.into(), strs(&["-c:v", lib, "-preset", "veryfast", "-crf", crf]), vec![]);
+    if !force_software || cfg!(target_os = "macos") {
+        if let Some(mut enc) = hardware_encoder(codec, quality) {
+            enc.software = Some(Box::new(sw));
+            return enc;
+        }
     }
+    sw
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -159,6 +238,8 @@ pub fn probe(path: &Path) -> Result<VideoInfo> {
 }
 
 pub fn run(args: &[String], cwd: Option<&Path>) -> Result<()> {
+    // a cancelled job must not start new work after its running programs were killed
+    crate::cancel::check()?;
     let mut cmd = Command::new(require("ffmpeg")?);
     cmd.args(args);
     if let Some(d) = cwd {

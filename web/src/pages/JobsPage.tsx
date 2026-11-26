@@ -6,6 +6,8 @@ import { Logo, baseName, fmtDate } from "../ui";
 function Status({ job }: { job: Job }) {
   if (job.status === "done") return <span className="badge solid">Done</span>;
   if (job.status === "failed") return <span className="badge fail">Failed</span>;
+  if (job.status === "cancelled") return <span className="badge">Cancelled</span>;
+  if (job.status === "review") return <span className="badge solid">Review</span>;
   return (
     <span className="badge">
       <span className="dot pulse" /> {job.status === "queued" ? "Queued" : job.stage}

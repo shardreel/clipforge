@@ -1,4 +1,4 @@
-import type { Health, Job, JobEvent, Options, SettingsUpdate, SettingsView, StorageReport, VideoInfo } from "./types";
+import type { Health, Job, JobEvent, Moment, Options, SettingsUpdate, SettingsView, StorageReport, VideoInfo } from "./types";
 
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
@@ -23,6 +23,8 @@ export const api = {
   jobs: () => req<Job[]>("/api/jobs"),
   job: (id: string) => req<Job>(`/api/jobs/${id}`),
   createJob: (source: string, options: Options) => req<Job>("/api/jobs", json("POST", { source, options })),
+  review: (id: string, moments: Moment[]) => req<{ ok: boolean }>(`/api/jobs/${id}/review`, json("POST", { moments })),
+  cancel: (id: string) => req<{ cancelling: boolean }>(`/api/jobs/${id}/cancel`, { method: "POST" }),
   rerender: (id: string, options: Options) => req<Job>(`/api/jobs/${id}/rerender`, json("POST", { options })),
   probe: (path: string) => req<VideoInfo>(`/api/probe?path=${encodeURIComponent(path)}`),
 };

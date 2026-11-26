@@ -12,15 +12,15 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Cap,{font},{size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,1,0,1,7,3,2,60,60,{marginv},1
-Style: Hook,{font},70,&H00000000,&H00000000,&H0000E5FF,&H0000E5FF,-1,0,0,0,100,100,0,0,3,18,0,8,80,80,230,1
+Style: Cap,{cap_font},{size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,7,3,2,60,60,{marginv},1
+Style: Hook,{hook_font},70,&H00000000,&H00000000,&H0000E5FF,&H0000E5FF,-1,0,0,0,100,100,0,0,3,18,0,8,80,80,230,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 ";
 
-const HIGHLIGHT: &str = r"{\c&H0000E5FF&\fscx112\fscy112}";
-const RESET: &str = r"{\c&H00FFFFFF&\fscx100\fscy100}";
+const HIGHLIGHT: &str = r"{\c&H0000E5FF&}";
+const RESET: &str = r"{\c&H00FFFFFF&}";
 
 fn ts(sec: f64) -> String {
     let sec = sec.max(0.0);
@@ -31,6 +31,18 @@ fn ts(sec: f64) -> String {
 
 fn esc(s: &str) -> String {
     s.replace('\\', "").replace('{', "(").replace('}', ")").replace('\n', " ")
+}
+
+fn has_indic(s: &str) -> bool {
+    s.chars().any(|c| ('\u{0900}'..='\u{0D7F}').contains(&c))
+}
+
+fn norm_case(s: &str) -> String {
+    if s.is_ascii() {
+        s.to_ascii_uppercase()
+    } else {
+        s.to_string()
+    }
 }
 
 fn chunk_words(words: &[Word]) -> Vec<Vec<Word>> {
@@ -62,8 +74,19 @@ pub struct AssOpts<'a> {
 pub fn build_ass(words: &[Word], clip_start: f64, clip_end: f64, out: &Path, o: &AssOpts) -> Result<()> {
     let dur = clip_end - clip_start;
     let hook_secs: f64 = 3.5;
+    let cap_font = if words.iter().any(|w| has_indic(&w.w)) {
+        "Noto Sans Devanagari ExtraBold"
+    } else {
+        "Arial Black"
+    };
+    let hook_font = if has_indic(o.hook) {
+        "Noto Sans Devanagari ExtraBold"
+    } else {
+        "Arial Black"
+    };
     let header = HEADER
-        .replace("{font}", "Arial Black")
+        .replace("{cap_font}", cap_font)
+        .replace("{hook_font}", hook_font)
         .replace("{size}", "84")
         .replace("{marginv}", &o.margin_v.to_string());
     let mut lines = vec![header];
@@ -72,13 +95,13 @@ pub fn build_ass(words: &[Word], clip_start: f64, clip_end: f64, out: &Path, o: 
             "Dialogue: 1,{},{},Hook,,0,0,0,,{{\\fad(120,200)}}{}",
             ts(0.0),
             ts(hook_secs.min(dur)),
-            esc(&o.hook.to_uppercase())
+            esc(&norm_case(o.hook))
         ));
     }
     let rel: Vec<Word> = words
         .iter()
         .filter(|w| w.e > clip_start && w.s < clip_end)
-        .map(|w| Word { w: esc(&w.w.to_uppercase()), s: w.s - clip_start, e: w.e - clip_start })
+        .map(|w| Word { w: esc(&norm_case(&w.w)), s: w.s - clip_start, e: w.e - clip_start })
         .collect();
     for chunk in chunk_words(&rel) {
         for (i, w) in chunk.iter().enumerate() {

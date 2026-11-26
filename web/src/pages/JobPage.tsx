@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { api, fileUrl, jobEvents } from "../api";
+import { api, fileUrl, frameUrl, isUrl, jobEvents } from "../api";
 import { OptionsForm } from "../OptionsForm";
-import type { Clip, Job, Options, Progress } from "../types";
-import { Card, CopyButton, Icon, Logo, baseName, fmtBytes, fmtTime } from "../ui";
+import type { Clip, Job, Moment, Options, Progress } from "../types";
+import { Card, CopyButton, Icon, Logo, NumInput, baseName, fmtBytes, fmtTime } from "../ui";
 
 const STAGES = [
   { id: "fetch", label: "Fetch" },
@@ -20,7 +20,7 @@ function Stepper({ job }: { job: Job }) {
     <div className="steps">
       {STAGES.map((s, i) => {
         const done = finished || (now >= 0 && i < now);
-        const active = !finished && i === now && job.status === "running";
+        const active = !finished && i === now && (job.status === "running" || job.status === "review");
         return (
           <div key={s.id} className={`step ${done ? "done" : ""} ${active ? "now" : ""}`}>
             <span className={`dot ${done ? "on" : ""} ${active ? "pulse" : ""}`} />
@@ -53,6 +53,81 @@ function DownloadBar({ p }: { p: Progress }) {
         </div>
       </div>
     </div>
+  );
+}
+
+/** Link to the moment in the source video (YouTube and most sites accept `t=`). */
+function watchUrl(source: string, t: number): string | null {
+  if (!isUrl(source)) return null;
+  try {
+    const u = new URL(source);
+    u.searchParams.set("t", `${Math.max(0, Math.floor(t))}s`);
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+type ReviewItem = Moment & { on: boolean };
+
+function ReviewPanel({ job }: { job: Job }) {
+  const moments = job.review ?? [];
+  const preselect = job.review_preselect || moments.length;
+  const [items, setItems] = useState<ReviewItem[]>(() => moments.map((m, i) => ({ ...m, on: i < preselect })));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const local = !isUrl(job.source);
+  const chosen = items.filter((x) => x.on);
+  const patch = (i: number, p: Partial<ReviewItem>) => setItems((xs) => xs.map((x, k) => (k === i ? { ...x, ...p } : x)));
+
+  async function submit() {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.review(job.id, chosen.map(({ on: _on, ...m }) => m));
+    } catch (e) {
+      setError((e as Error).message);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card title="Review moments" right={<span className="muted">{chosen.length} selected</span>}>
+      <p className="hint" style={{ marginTop: 0 }}>
+        Untick weak picks, fix titles, nudge start and end. Only ticked moments are rendered.
+      </p>
+      <div className="stack" style={{ gap: 12 }}>
+        {items.map((m, i) => {
+          const link = watchUrl(job.source, m.start);
+          return (
+            <div key={i} className="row wrap" style={{ gap: 12, alignItems: "center", opacity: m.on ? 1 : 0.5 }}>
+              <input type="checkbox" checked={m.on} onChange={(e) => patch(i, { on: e.target.checked })} aria-label="Render this moment" />
+              {local ? (
+                <img src={frameUrl(job.source, m.peak)} alt="" width={128} style={{ borderRadius: 6 }} loading="lazy" />
+              ) : link ? (
+                <a className="btn sm" href={link} target="_blank" rel="noreferrer">
+                  Watch {fmtTime(m.start)}
+                </a>
+              ) : null}
+              <input type="text" style={{ flex: "1 1 220px" }} value={m.title} onChange={(e) => patch(i, { title: e.target.value })} />
+              <div style={{ width: 96 }}>
+                <NumInput value={m.start} step={1} min={0} onChange={(v) => patch(i, { start: v })} />
+              </div>
+              <div style={{ width: 96 }}>
+                <NumInput value={m.end} step={1} min={0} onChange={(v) => patch(i, { end: v })} />
+              </div>
+              <span className="mono faint">{Number.isFinite(m.end - m.start) ? `${(m.end - m.start).toFixed(0)}s` : "-"}</span>
+            </div>
+          );
+        })}
+      </div>
+      {error && <div className="alert" style={{ marginTop: 12 }}>{error}</div>}
+      <div className="row" style={{ justifyContent: "flex-end", marginTop: 16 }}>
+        <button className="btn primary" disabled={busy || chosen.length === 0} onClick={submit}>
+          {busy ? "Starting..." : `Render ${chosen.length} clip${chosen.length === 1 ? "" : "s"}`}
+        </button>
+      </div>
+    </Card>
   );
 }
 
@@ -106,9 +181,11 @@ export function JobPage({ id, go }: { id: string; go: (hash: string) => void }) 
       else if (e.type === "stage") setJob((j) => j && { ...j, stage: e.stage, progress: null });
       else if (e.type === "progress") setJob((j) => j && { ...j, progress: e.progress });
       else if (e.type === "log") setJob((j) => j && { ...j, log: [...j.log, e.line] });
+      else if (e.type === "review")
+        setJob((j) => j && { ...j, status: "review", review: e.moments, review_preselect: e.preselect, progress: null });
       else if (e.type === "status") {
         setJob((j) => j && { ...j, status: e.status, error: e.error ?? j.error });
-        if (e.status === "done" || e.status === "failed") api.job(id).then(setJob).catch(() => undefined);
+        if (e.status === "done" || e.status === "failed" || e.status === "cancelled") api.job(id).then(setJob).catch(() => undefined);
       }
     });
   }, [id]);
@@ -120,6 +197,32 @@ export function JobPage({ id, go }: { id: string; go: (hash: string) => void }) 
   useEffect(() => {
     if (job && !opts) setOpts(job.options);
   }, [job, opts]);
+
+  async function cancel() {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.cancel(id);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resume() {
+    if (!job) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await api.rerender(id, job.options);
+      go(`#/job/${next.id}`);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function rerender() {
     if (!opts) return;
@@ -140,10 +243,12 @@ export function JobPage({ id, go }: { id: string; go: (hash: string) => void }) 
     return <div className="page"><div className="empty"><Logo size={28} />Loading job...</div></div>;
   }
 
-  const running = job.status === "queued" || job.status === "running";
+  const running = job.status === "queued" || job.status === "running" || job.status === "review";
   const badge =
     job.status === "done" ? <span className="badge solid">Done</span>
     : job.status === "failed" ? <span className="badge fail">Failed</span>
+    : job.status === "cancelled" ? <span className="badge">Cancelled</span>
+    : job.status === "review" ? <span className="badge solid">Waiting for review</span>
     : <span className="badge"><span className="dot pulse" /> {job.status === "queued" ? "Queued" : "Running"}</span>;
 
   return (
@@ -153,16 +258,35 @@ export function JobPage({ id, go }: { id: string; go: (hash: string) => void }) 
           <h1 className="trunc">{baseName(job.source)}</h1>
           <p className="mono faint trunc">{job.source}</p>
         </div>
-        {badge}
+        <div className="row" style={{ gap: 10 }}>
+          {badge}
+          {running && (
+            <button className="btn sm" disabled={busy} onClick={cancel}>
+              {busy ? "Cancelling..." : "Cancel"}
+            </button>
+          )}
+          {(job.status === "failed" || job.status === "cancelled") && (
+            <button
+              className="btn sm primary"
+              disabled={busy}
+              onClick={resume}
+              title="Run again with the same settings. Downloads, analysis and finished clips are reused."
+            >
+              Resume
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="section"><Stepper job={job} /></div>
 
       {job.stage === "fetch" && job.progress && <DownloadBar p={job.progress} />}
 
-      {job.error && <div className="alert section"><b>Error: </b>{job.error}</div>}
+      {job.status === "review" && job.review && <div className="section"><ReviewPanel key={job.review.length} job={job} /></div>}
 
-      {(running || job.status === "failed") && (
+      {job.error && job.status !== "cancelled" && <div className="alert section"><b>Error: </b>{job.error}</div>}
+
+      {(running || job.status === "failed" || job.status === "cancelled") && (
         <div className="section">
           <h3>Log</h3>
           <div className="log" ref={logRef}>

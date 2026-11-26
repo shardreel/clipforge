@@ -1,6 +1,8 @@
 # Secrets: keep the example, ignore everything else
 .env
 .env.*
+skills/
+.playwright-mcp/
 !.env.example
 
 # Rust build output
@@ -31,3 +33,4 @@ ggml-*.bin
 
 # YouTube cookies (session secret)
 cookies.txt
+HANDOVER.md

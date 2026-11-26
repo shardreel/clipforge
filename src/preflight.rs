@@ -7,7 +7,7 @@ use sysinfo::{Disks, System};
 const GB: u64 = 1024 * 1024 * 1024;
 const MIN_DISK_GB: u64 = 10;
 const REC_DISK_GB: u64 = 30;
-const MIN_RAM_GB: u64 = 8;
+const MIN_RAM_GB: u64 = 4;
 const REC_RAM_GB: u64 = 16;
 const MIN_CORES: usize = 4;
 const REC_CORES: usize = 8;
@@ -68,7 +68,9 @@ pub fn run() -> Report {
         Check {
             name: "Memory",
             level: level(ram_gb, MIN_RAM_GB, REC_RAM_GB, true),
-            detail: format!("{ram_gb} GB RAM (need {MIN_RAM_GB}, recommended {REC_RAM_GB})"),
+            detail: format!(
+                "{ram_gb} GB RAM (need {MIN_RAM_GB}, recommended {REC_RAM_GB}; under 8 GB use the small whisper model and light mode)"
+            ),
         },
         Check {
             name: "CPU cores",
@@ -86,13 +88,16 @@ pub fn run() -> Report {
         });
     } else {
         let gpu = platform::has_nvidia();
+        let enc = crate::media::pick_encoder("h264", "high", false);
         checks.push(Check {
             name: "GPU",
             level: if gpu { "pass" } else { "warn" },
             detail: if gpu {
                 "NVIDIA GPU found".into()
+            } else if enc.hardware() {
+                format!("no NVIDIA GPU; encoding uses the integrated GPU ({}), transcription runs on CPU. Light mode is on by default", enc.name)
             } else {
-                "no NVIDIA GPU found; encoding and transcription run on CPU (slow)".into()
+                "no NVIDIA GPU or VAAPI device; encoding and transcription run on CPU. Light mode is on by default".into()
             },
         });
     }

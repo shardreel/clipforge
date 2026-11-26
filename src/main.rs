@@ -1,4 +1,6 @@
 mod api;
+mod cancel;
+mod fastdl;
 mod ingest;
 mod jobs;
 mod llm;
@@ -22,6 +24,9 @@ use tower_http::services::{ServeDir, ServeFile};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
+    // whisper.cpp/ggml print model-loading details to stderr on every load; no logging backend
+    // is compiled into whisper-rs, so this routes them nowhere (errors still surface as Results)
+    whisper_rs::install_logging_hooks();
     let addr: SocketAddr = std::env::var("CLIPFORGE_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8787".into())
         .parse()?;
